@@ -1,0 +1,658 @@
+#!/usr/bin/perl
+
+# psmon / Process monitoring daemon
+#  * author  - Tatsuya SHORIKI <show.tatsu.devel@gmail.com>
+#  * release - 2016/07/23 ver 0.1
+
+use strict;
+use warnings;
+use Getopt::Std;
+use File::Basename;
+
+my $Daemon   = 0;
+my $DebugExit = 0;
+my $SkipFirst = 0;
+
+my $default_config = +{
+    syslog_bin => '/usr/bin/logger',
+    config_dir => './conf.d',
+    syslog_tag => 'MANUAL-ALERT',
+    syslog_priority => 'local0.error',
+    enable_syslog => 0, # 0:disable, 1:enable
+    enable_trace => 0,  # 0:disable, 1:enable
+    interval => 10, # sec.
+};
+our $config = +{ %$default_config };
+
+$config->{config_dir} = Psmon::Util::abs_path($config->{config_dir});
+$Psmon::Process::PS_BIN = 'ps';
+
+# * psmon: startup options
+# -i num : Loop interval time (seconds) in daemon, debug loop mode.
+# -c path: Specify config directory. Default is "./conf.d"
+# -d     : Daemon mode. Loop infinitely.
+# -D num : Debug loop mode. Loop specified times and exit.
+# -s     : Enable syslog alert.
+# -t     : Enable trace log into STDERR.
+# -q     : Skip alerts in first loop.
+OPTIONS: {
+    my %opts;
+    getopts ( "i:c:D:dstq", \%opts );
+
+    if (defined $opts{i}) {
+        die "option -i format error. An integer required." if ("$opts{i}" !~ /^[0-9]+$/);
+        $config->{interval} = $opts{i} * 1;
+    }
+    $config->{config_dir}    = $opts{c} if ($opts{c});
+    $config->{enable_trace}  = $opts{t} if ($opts{t});
+    $config->{enable_syslog} = $opts{s} if ($opts{s});
+    $Daemon    = $opts{d} if ($opts{d});
+    $DebugExit = $opts{D} if ($opts{D});
+    $SkipFirst = $opts{q} if ($opts{q});
+}
+
+
+my $PROC_ALERT_FORMAT = 'psmon: %s: name=[%s]';
+my $STD_ALERT_FORMAT  = 'psmon: %s: %s';
+my $ALERT_COMMENT_FORMAT = ' ;; %s';
+my $ALERM_ACTIONS = +{
+    $Psmon::Monitor::S_OK => sub {
+        my $m = shift;
+        my $msg = sprintf($PROC_ALERT_FORMAT, 'Normal', $m->name);
+        my $cmt = sprintf('count=[%d]', $m->count);
+        $msg .= sprintf($ALERT_COMMENT_FORMAT, $cmt);
+        logger($msg);
+    },
+    $Psmon::Monitor::S_MAX => sub {
+        my $m = shift;
+        my $msg = sprintf($PROC_ALERT_FORMAT, 'Critical', $m->name);
+        my $cmt = sprintf('count=[%d] exceeds max=[%s]', $m->count, $m->max);
+        $msg .= sprintf($ALERT_COMMENT_FORMAT, $cmt);
+        logger($msg);
+    },
+    $Psmon::Monitor::S_MIN => sub {
+        my $m = shift;
+        my $msg = sprintf($PROC_ALERT_FORMAT, 'Critical', $m->name);
+        my $cmt = sprintf('count=[%d] is lower than min=[%s]', $m->count, $m->min);
+        $msg .= sprintf($ALERT_COMMENT_FORMAT, $cmt);
+        logger($msg);
+    },
+    $Psmon::Monitor::S_WARN => sub {
+        my $m = shift;
+        my $msg = sprintf($PROC_ALERT_FORMAT, 'Warning', $m->name);
+        my $cmt = sprintf('count=[%d] exceeds warn=[%s]', $m->count, $m->warn);
+        $msg .= sprintf($ALERT_COMMENT_FORMAT, $cmt);
+        logger($msg);
+    },
+    $Psmon::Monitor::S_UNKNOWN => sub {
+        my $m = shift;
+        my $msg = sprintf($STD_ALERT_FORMAT, "code error. unknown status");
+        logger($msg);
+    },
+};
+
+
+# Main process of psmon.
+
+# Main loop terminate flag.
+my $Terminate = 0;
+my $Hangup = 0;
+MAIN: {
+    $SIG{HUP}  = \&catch_hup;
+    $SIG{TERM} = \&catch_term;
+    
+    do {
+        $Hangup = 0;
+        $Terminate = 0;
+        # Monitor list, loaded from monitor configs.
+        my $Monitors  = [];
+
+        # Load monitor config files into $Monitors
+        opendir(my $dh, $config->{config_dir})
+            or die "psmon fail open confdir. $!";
+        while(my $conf_name = readdir($dh)) {
+            next if $conf_name =~ /^\./;
+            my $conf_path = "$config->{config_dir}/$conf_name";
+            next if (-d $conf_path );
+
+            if(my $c = load_monitor( $conf_path )) {
+                push(@$Monitors, $c);
+            } else {
+                die "load monitor failed. path=[$conf_path]";
+            }
+        }
+        closedir($dh);
+
+        # Main loop start.
+        while ( not $Terminate ) {
+            my $procs = Psmon::Process::Fetch();
+
+            # rotate counter and countup start.
+            $_->begin_update() foreach (@$Monitors);
+            bulk_match($Monitors, $procs);
+
+            foreach (@$Monitors) {
+                # countup end and update status.
+                $_->end_update();
+                # execute actions if the monitor status was changed.
+                if($_->status_changed) {
+                    # ... but, when SkipFirst(-q) is on,
+                    # do not trigger the action in the first loop,
+                    if ($_->in_succession or not $SkipFirst) {
+                        my $status = $_->status;
+                        my $action = $ALERM_ACTIONS->{$status};
+                        $action->($_) if($action);
+                    }
+                }
+            }
+            
+            if ($config->{enable_trace}) {
+                trace(Psmon::Process::ToString($_)) foreach(@$procs);
+                trace($_->to_s(1)) foreach (@$Monitors);
+            }
+
+            # main loop control...
+            if ($DebugExit > 0) {
+                # debug loop mode. Run debug-exit(-D num) times.
+                if (--$DebugExit <= 0) {
+                    $Terminate = 1
+                } else {
+                    sleep $config->{interval};
+                }
+            } elsif ($Daemon) {
+                # daemon mode. Run forever.
+                sleep $config->{interval};
+            } else {
+                # console mode. Run once.
+                $Terminate = 1;
+            }
+        }
+    } while ($Hangup);
+};
+
+# - bulk_match
+#  
+#  Matrix execution of Psmon::Monitor.countup_if_match.
+#  Call Psmon::Monitor.begin_update for each monitors
+#  before run bulk_match.
+#  
+sub bulk_match {
+    my ($monitors, $procs) = @_;
+    foreach my $pt (@$procs) {
+        foreach my $mt (@$monitors) {
+            $mt->countup_if_match($pt);
+        }
+    }
+}
+
+# - catch_hup
+#  Handle HUP signal. Set flags to exit current loop,
+#  reload monitors and re-entry main loop.
+sub catch_hup {
+    system ( "pkill -HUP -P $$" );
+    $Hangup = 1 if $Daemon;
+    $Terminate = 1;
+}
+
+# - catch_term
+#  Handle TERM signal. Set flags to exit current loop,
+#  and exit process.
+sub catch_term {
+    system ( "pkill -TERM -P $$" );
+    $Terminate = 1;
+}
+
+# * read_config ( path )
+#  Read from config file returns key value hash.
+#  Entries terminated by "LF" and key-value(s) separated by equal(=).
+sub read_config {
+    my ($path) = @_;
+
+    my $focus = '_';
+    my $lastkey = $focus;
+    my $cache = +{ $focus => +{} };
+    open(my $fh, '<', $path) or die $!;
+    while(my $line = <$fh>) {
+        chomp($line);
+        $line =~ s/^\s+//;
+        $line =~ s/\s+$//;
+        $line =~ s/^#.*$//;
+        next unless($line);
+        if($line =~ m/^\s*\[\s*(\.+)\s*\]\s*$/) {
+            $focus = "$1";
+            $cache->{$focus} = +{ };
+        } elsif($line =~ m/^([0-9A-Za-z_.]+)\s*=\s*(.*)$/) {
+            my ($key, $value) = ($1, $2);
+            $lastkey = "$key";
+            $cache->{$focus}->{$lastkey} = $value;
+        } elsif($line =~ m/^\s*=\s*(.*)$/){
+            my ($value) = ($1);
+            if($lastkey) {
+                $cache->{$focus}->{$lastkey} .= $value;
+            } else {
+                # format error.
+                die "FATAL: Format error on ${path}, line $.";
+            }
+        } else {
+            # format error.
+            die "FATAL: Format error on ${path}, line $.";
+        }
+    }
+    close($fh);
+    return $cache;
+}
+
+# * load_monitor ( path )
+#  Load Psmon::Monitor data from a monitor config file.
+sub load_monitor {
+    my ($path) = @_;
+    if (my $hash = read_config($path)) {
+        if (my $main_mon = delete $hash->{_}) {
+            my $m = Psmon::Monitor->new(%$main_mon);
+            return $m;
+        } else {
+            # group monitor, not impl yet.
+        }
+    } else {
+        # error.
+    }
+}
+
+# * trace ( message )
+#  Print trace message when trace mode is enabled.
+sub trace {
+    my ($message) = @_;
+    our $config;
+    print STDERR "TRACE: $message\n" if($config->{enable_trace});
+}
+
+# * logger ( message )
+#  Print log message into syslog and trace log.
+sub logger {
+    my ($message) = @_;
+    our $config;
+    if($config->{enable_trace}) {
+        print STDERR "TRACE: $message\n";
+    }
+    if($config->{enable_syslog}) {
+        my @com = ($config->{syslog_bin});
+        push(@com, "-p", $config->{syslog_priority});
+        push(@com, "-t", $config->{syslog_tag}) if $config->{syslog_tag};
+        push(@com, "'${message}'");
+        system(join(" ", @com));
+    }
+}
+
+
+BEGIN {
+    package Psmon::Util;
+    use strict;
+    use warnings;
+    use FindBin;
+
+    sub abs_path {
+        my ($path, $base) = @_;
+        $base = $FindBin::Bin unless defined $base;
+        die "abs_path's 2nd argument requires absolute path." unless $base =~ m{^/};
+        return $path if ($path =~ m{^/});
+        do {} while($path =~ s{^\./}{});
+        $base =~ s{/$}{};
+        return "$base/$path";
+    }
+
+    package Psmon::Process;
+    #   Module: Psmon::Process
+    #   - product: psmon / Process monitoring daemon
+    #   - author: Tatsuya SHORIKI <show.tatsu.devel@gmail.com>
+    #   - release: 2016/07/23  ver0.1
+    use strict;
+    use warnings;
+
+    our $PS_BIN = 'ps';
+    our $PS_OPT = '-eo pid,ppid,user,group,comm,command';
+    our $PS_PTN = qr/^(\s*PID)(\s+PPID)\s+(USER\s+)(GROUP\s+)(COMMAND\s*)COMMAND\s*$/;
+
+    # - Psmon::Process::Fetch
+    #  Load information from all processes on this system,
+    #  via 'ps -eo pid,ppid,user,group,comm,command'
+    #  and returns an array reference of the process information hashes.
+    sub Fetch {
+        my @lines = (`$PS_BIN $PS_OPT 2>/dev/null`);
+        my $header = shift @lines;
+        unless($header =~ $PS_PTN) {
+            die "ps command output unexpected text.";
+        }
+        my @start = @-;
+        my @end   = @+;
+        my $table = [];
+        for my $line (@lines) {
+            chomp($line);
+            my $n;
+            my $info = +{ };
+            $n = substr($line, $start[1], $end[1]);
+            $n =~ s/^\s+//;
+            $n =~ s/\s+$//;
+            $info->{pid}  = $n * 1;
+            $n = substr($line, $start[2], $end[2] - $start[2]);
+            $n =~ s/^\s+//;
+            $n =~ s/\s+$//;
+            $info->{ppid} = $n * 1;
+            $n = substr($line, $start[3], $end[3] - $start[3]);
+            $n =~ s/^\s+//;
+            $n =~ s/\s+$//;
+            $info->{user} = $n;
+            $n = substr($line, $start[4], $end[4] - $start[4]);
+            $n =~ s/^\s+//;
+            $n =~ s/\s+$//;
+            $info->{group} = $n;
+            $n = substr($line, $start[5], $end[5] - $start[5]);
+            $n =~ s/^\s+//;
+            $n =~ s/\s+$//;
+            $info->{comm} = $n;
+            $n = substr($line, $end[5]);
+            $n =~ s/^\s+//;
+            $n =~ s/\s+$//;
+            $info->{command} = $n;
+            push(@$table, $info);
+        }
+        return $table;
+    }
+
+    sub ToString {
+        my $h = shift;
+        my $buf = sprintf(
+            "* Process: pid=[%d] ppid=[%d] proc=[%s] owner=[%s:%s]\n",
+            $h->{pid}, $h->{ppid}, $h->{comm},
+            $h->{user}, $h->{group});
+        $buf .= sprintf("  > %s\n", $h->{command});
+        return $buf;
+    }
+
+    package Psmon::Monitor;
+    #   Module: Psmon::Monitor
+    #   - product: psmon / Process monitoring daemon
+    #   - author: Tatsuya SHORIKI <show.tatsu.devel@gmail.com>
+    #   - release: 2016/07/23  ver0.1
+    use strict;
+    use warnings;
+
+    our @FIELDS_TH = qw(max min warn);
+    our @FIELDS_RL = qw(proc match user group pidfile ppidfile);
+    our @FIELDS = (qw(name memo), @FIELDS_TH, @FIELDS_RL);
+    our @FLAGS = qw(_count _status _lastcount _laststatus _pid _ppid);
+
+    my %DEFAULTS = ();
+    my %FLAGS = map { $_ => undef } @FLAGS;
+
+    our $S_OK = 'ok';
+    our $S_MIN = 'min';
+    our $S_MAX = 'max';
+    our $S_WARN = 'warn';
+    our $S_UNKNOWN = 'unknown';
+
+
+    sub new {
+        my ($class, %args) = @_;
+        my %accepts = map{ $_ => 1 } @FIELDS;
+        foreach(keys %args) {
+            die 'Unknown input for Psmon::Monitor.new' unless $accepts{$_};
+        }
+        my $attr = +{ %DEFAULTS, %args, %FLAGS };
+        if (scalar(my @err = _CheckFields($attr))) {
+            die join("\n\t", "Build monitor error", @err);
+        }
+        $attr = _BuildArgs($attr);
+        return bless $attr, $class;
+    }
+
+    sub name  { _attr_ro('name' , @_); }
+    sub memo  { _attr_ro('memo' , @_); }
+    sub max   { _attr_ro('max'  , @_); }
+    sub min   { _attr_ro('min'  , @_); }
+    sub warn  { _attr_ro('warn' , @_); }
+    sub proc  { _attr_ro('proc' , @_); }
+    sub user  { _attr_ro('user' , @_); }
+    sub group { _attr_ro('group', @_); }
+    sub match { _attr_ro('match', @_); }
+    sub pidfile  { _attr_ro('pidfile' , @_); }
+    sub ppidfile { _attr_ro('ppidfile', @_); }
+
+    sub count  { _attr_ro('_count' , @_); }
+    sub status { _attr_ro('_status', @_); }
+    sub pid    { _attr_ro('_pid'   , @_); }
+    sub ppid   { _attr_ro('_ppid'  , @_); }
+
+    sub reload_pidfiles {
+        my $self = shift;
+        if(my $path = $self->pidfile) {
+            $self->{_pid} = PidFromFile($path);
+        }
+        if(my $path = $self->ppidfile) {
+            $self->{_ppid} = PidFromFile($path);
+        }
+    }
+
+    # * begin_update
+    #  Prepare the monitor instance to count processes.
+    #  Load pid files, and rotate counters.
+    sub begin_update {
+        my $self = shift;
+        $self->{_lastcount} = $self->{_count};
+        $self->{_count} = 0;
+        $self->reload_pidfiles();
+        return $self;
+    }
+
+    # * end_update
+    #  End the process counting phase started by begin_update.
+    #  Update status by a threshold value determination.
+    sub end_update {
+        my $self = shift;
+        $self->{_laststatus} = $self->{_status};
+        $self->{_status} = $S_UNKNOWN;
+        my $c = $self->{_count};
+        if($self->{min} # min : Major alert
+                and ($c < $self->{min})) {
+            $self->{_status} = $S_MIN;
+        } elsif ($self->{max} # max: Major alert
+                and ($c > $self->{max})) {
+            $self->{_status} = $S_MAX;
+        } elsif ($self->{warn} # max: Major alert
+                and ($c > $self->{warn})) {
+            $self->{_status} = $S_WARN;
+        } else {
+            $self->{_status} = $S_OK;
+        }
+        return $self;
+    }
+
+    # * countup_if_match ( Hashref=ProcessInfo )
+    #  Check process, and increase counter if the process
+    #  is matched to the monitor's matching rules.
+    sub countup_if_match {
+        my $self = shift;
+        if (scalar @_ == 1 and ref $_[0] ne 'ARRAY') {
+            my ($proc) = @_;
+            return if (defined $self->{_ppid}
+                    and $proc->{ppid} != $self->{_ppid});
+            return if (defined $self->{_pid}
+                    and $proc->{pid} != $self->{_pid});
+            return if (defined $self->{proc}
+                    and $proc->{comm} ne $self->{proc});
+            return if (defined $self->{user}
+                    and $proc->{user} ne $self->{user});
+            return if (defined $self->{group}
+                    and $proc->{group} ne $self->{group});
+            return if (defined $self->{match}
+                    and $proc->{command} !~ $self->{match});
+            # matched process.
+            $self->{_count}++;
+            return 1;
+        } else {
+            my @arguments = @_;
+            if (scalar @_ == 1 and ref $arguments[0] eq 'ARRAY') {
+                @arguments = @{$arguments[0]};
+            }
+            my $o = 1;
+            $o |= $self->countup_if_match($_) foreach(@arguments);
+            return $o;
+        }
+    }
+
+    # * count_changed
+    #  Check the count has been changed
+    #  from the previous update phace.
+    sub count_changed {
+        my $self = shift;
+        my ($a, $b) = ($self->{_count}, $self->{_lastcount});
+        return ($a != $b) if (defined $a and defined $b);
+        return 1 if(defined $a or defined $b);
+        return 0;
+    }
+
+    # * status_changed
+    #  Check the status has been changed
+    #  from the previous update phace.
+    sub status_changed {
+        my $self = shift;
+        my ($a, $b) = ($self->{_status}, $self->{_laststatus});
+        return ($a ne $b) if (defined $a and defined $b);
+        return 1 if(defined $a or defined $b);
+        return 0;
+    }
+
+    # * in_succession
+    #  Whether the monitor instance has more than twice update phases.
+    sub in_succession {
+        my $self = shift;
+        return (defined $self->{_laststatus});
+    }
+
+    # * to_s ( with_flags:boolean )
+    #  To string method to trace monitor status.
+    #  When "with_flags" set true, the result includes class private members.
+    sub to_s {
+        my $self = shift;
+        my ($with_flags) = @_;
+        my $buf = "";
+        $buf .= sprintf("* Monitor: %s (Psmon::Monitor, name=%s)\n",
+            $self->{name}, $self->{name});
+        $buf .= "- [Threshold]\n";
+        foreach my $k (@FIELDS_TH) {
+            $buf .= sprintf("  %-5s: %d\n", $k, $self->{$k}) if $self->{$k};
+        }
+        $buf .= "- [Rules]\n";
+        foreach my $k (@FIELDS_RL) {
+            $buf .= sprintf("  %-8s: %s\n", $k, $self->{$k}) if $self->{$k};
+        }
+        if ($with_flags) {
+            $buf .= "- [Flags]\n";
+            foreach my $k (@FLAGS) {
+                $buf .= sprintf("  %-8s: %s\n", $k, $self->{$k}) if defined $self->{$k};
+            }
+        }
+        return $buf;
+    }
+
+    # * Private method members.
+    sub _attr_rw {
+        my ($name, $self, $value) = @_;
+        # Getter
+        return $self->{$name} if scalar @_ == 2;
+        # Setter
+        $self->{$name} = $value;
+    }
+    sub _attr_ro {
+        my ($name, $self) = @_;
+        # Getter
+        return $self->{$name} if scalar @_ == 2;
+        # Setter
+        die "[$name] is readonly access.";
+    }
+    
+    # * PidFromFile ( path ) : [static function]
+    #  Read PID (process ID) from pid file.
+    #  This returns 0 when the pid file was not found
+    #  or failed to read integers from the file.
+    sub PidFromFile {
+        shift if ($_[0] eq __PACKAGE__);
+        my ($pidfile) = @_;
+        return unless defined $pidfile;
+        return 0 unless -f $pidfile;
+
+        my $pid = 0;
+        if (open(my $fh, '<', $pidfile)) {
+            my $line;
+            eval { $line = <$fh>; };
+            close($fh);
+            if($line and $line =~ /^\s*([0-9]+)\s*/) {
+                $pid = $1 * 1;
+            }
+        }
+        return $pid;
+    }
+
+
+    sub _BuildArgs {
+        shift if (scalar(@_) > 0 and $_[0] eq __PACKAGE__);
+        my ($hash) = @_;
+
+        if (defined $hash->{match} and not ref $hash->{match}) {
+            $hash->{match} = qr/$hash->{match}/;
+        }
+        return $hash;
+    }
+
+    sub _CheckFields {
+        shift if (scalar(@_) > 0 and $_[0] eq __PACKAGE__);
+        my ($hash) = @_;
+
+        my %f = %$hash;
+        my @err; # Found errors in checks
+
+        # Check: Required fields
+        foreach my $k (qw(name)) {
+            if(not defined $f{$k} or length("$f{$k}") == 0) {
+                push(@err, "[$k] is required");
+            }
+            delete $f{$k};
+        }
+
+        # Check: Required least one rule to search processes
+        my $sopts = 0;
+        foreach my $k (qw(proc match user group)) {
+            ++$sopts if(defined $f{$k} and length("$f{$k}") > 0);
+            delete $f{$k};
+        }
+        foreach my $k (qw(pidfile ppidfile)) {
+            ++$sopts if(defined $f{$k} and length("$f{$k}") > 0);
+            if(defined $f{$k} and $f{$k} !~ m{^/}) {
+                push(@err, "Parameter [$k] must be an absolute path to the pidfile");
+            }
+            delete $f{$k};
+        }
+        push(@err, 'Least one search rule required') unless($sopts);
+
+        # Check: Threshold parameters must be positive-integers.
+        foreach my $k (qw(max min warn)) {
+            if(defined $hash->{$k} and "$hash->{$k}" !~ /^[0-9]+$/) {
+                push(@err, "Parameter [$k] must be a positive integer");
+            }
+            delete $f{$k};
+        }
+
+        # ... and remove parameters, acceptable but none checked.
+        foreach my $k (qw(memo _count _lastcount _status _laststatus _pid _ppid)) {
+            delete $f{$k};
+        }
+
+        # Check: Not contains any unsupported arguments
+        foreach my $k (keys %f) {
+            push(@err, "Unknown monitor argument [$k]");
+        }
+
+        return @err if scalar(@err);
+        return;
+    }
+};
+

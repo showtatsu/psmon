@@ -1,0 +1,59 @@
+#!/bin/sh
+
+# chkconfig: 345 13 13
+# description: Process Monitor
+# processname: psmon
+
+PSMON_BIN="/usr/local/bin/psmon"
+CFGDIR="/etc/psmon.d"
+psmon_opts="-d -s -i 10 -c $CFGDIR"
+
+check_start() {
+    $0 status > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        echo "Success."
+        exit 0
+    fi
+    echo "Failed."
+    exit 1
+}
+
+case "$1" in
+    start)
+        $0 status > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            echo "psmon is alredy running."
+            exit 1
+        fi
+        echo -n $"Starting psmon: "
+        $PSMON_BIN $psmon_opts >/dev/null 2>&1 &
+        sleep 1
+        check_start
+        ;;
+    stop)
+        echo -n "Stopping psmon: "
+        pkill -TERM -of $PSMON_BIN
+        echo Done.
+        ;;
+    restart)
+        $0 stop
+        sleep 1
+        $0 start
+        ;;
+    reload)
+        pkill -HUP -of $PSMON_BIN
+        ;;
+    status)
+        pid=`pgrep -of $PSMON_BIN`
+        if [ -n "$pid" ]; then
+            echo "psmon (pid $pid) is running..."
+            exit 0
+        fi
+        echo "psmon is stopped"
+        exit 3
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|switch|status|check}"
+        exit 1
+esac
+

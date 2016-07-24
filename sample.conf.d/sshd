@@ -1,0 +1,6 @@
+name  = sshd
+max   = 0
+min   = 1
+warn  = 0
+pidfile = /var/run/sshd.pid
+memo  = monitor sshd daemon process

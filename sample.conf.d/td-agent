@@ -1,0 +1,5 @@
+name = td-agent
+user = td-agent
+pidfile = /var/run/td-agent/td-agent.pid
+min  = 1
+
