@@ -15,7 +15,7 @@ my $SkipFirst = 0;
 
 my $default_config = +{
     syslog_bin => '/usr/bin/logger',
-    config_dir => './conf.d',
+    config_dir => '/etc/psmon.d',
     syslog_tag => 'MANUAL-ALERT',
     syslog_priority => 'local0.error',
     enable_syslog => 0, # 0:disable, 1:enable
