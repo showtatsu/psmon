@@ -147,7 +147,6 @@ MAIN: {
             }
             
             if ($config->{enable_trace}) {
-                trace(Psmon::Process::ToString($_)) foreach(@$procs);
                 trace($_->to_s(1)) foreach (@$Monitors);
             }
 
@@ -378,8 +377,8 @@ BEGIN {
 
     our @FIELDS_TH = qw(max min warn);
     our @FIELDS_RL = qw(proc match user group pidfile ppidfile);
-    our @FIELDS = (qw(name memo), @FIELDS_TH, @FIELDS_RL);
-    our @FLAGS = qw(_count _status _lastcount _laststatus _pid _ppid);
+    our @FIELDS = (qw(name memo debug), @FIELDS_TH, @FIELDS_RL);
+    our @FLAGS = qw(_count _status _lastcount _laststatus _pid _ppid _debug_procs);
 
     my %DEFAULTS = ();
     my %FLAGS = map { $_ => undef } @FLAGS;
@@ -389,7 +388,6 @@ BEGIN {
     our $S_MAX = 'max';
     our $S_WARN = 'warn';
     our $S_UNKNOWN = 'unknown';
-
 
     sub new {
         my ($class, %args) = @_;
@@ -439,6 +437,7 @@ BEGIN {
         my $self = shift;
         $self->{_lastcount} = $self->{_count};
         $self->{_count} = 0;
+        $self->{_debug_procs} = [] if $self->{debug};
         $self->reload_pidfiles();
         return $self;
     }
@@ -487,6 +486,10 @@ BEGIN {
                     and $proc->{command} !~ $self->{match});
             # matched process.
             $self->{_count}++;
+            
+            # for debug mode.
+            push(@{$self->{_debug_procs}}, $proc) if($self->{debug});
+
             return 1;
         } else {
             my @arguments = @_;
@@ -548,7 +551,11 @@ BEGIN {
         if ($with_flags) {
             $buf .= "- [Flags]\n";
             foreach my $k (@FLAGS) {
-                $buf .= sprintf("  %-8s: %s\n", $k, $self->{$k}) if defined $self->{$k};
+                $buf .= sprintf("  %-8s: %s\n", $k, $self->{$k}) if defined $self->{$k} and not ref $self->{$k};
+            }
+            if($self->{debug}) {
+                $buf .= sprintf("- [Debug: Matched] %d processes\n", scalar(@{$self->{_debug_procs}}));
+                $buf .= Psmon::Process::ToString($_) foreach(@{$self->{_debug_procs}});
             }
         }
         return $buf;
@@ -642,7 +649,7 @@ BEGIN {
         }
 
         # ... and remove parameters, acceptable but none checked.
-        foreach my $k (qw(memo _count _lastcount _status _laststatus _pid _ppid)) {
+        foreach my $k (qw(memo debug _count _lastcount _status _laststatus _pid _ppid _debug_procs)) {
             delete $f{$k};
         }
 
