@@ -14,12 +14,16 @@ my $DebugExit = 0;
 my $SkipFirst = 0;
 
 my $default_config = +{
-    syslog_bin => '/usr/bin/logger',
     config_dir => '/etc/psmon.d',
-    syslog_tag => 'MANUAL-ALERT',
-    syslog_priority => 'local0.error',
     enable_syslog => 0, # 0:disable, 1:enable
+    syslog_bin => '/usr/bin/logger',
+    syslog_tag => 'MANUAL-ALERT',
+    syslog_priority_alert => 'local0.error',
+    syslog_priority_info  => 'local0.info',
+    syslog_priority_trace => undef,
     enable_trace => 0,  # 0:disable, 1:enable
+    enable_info  => 1,  # 0:disable, 1:enable
+    enable_alert => 1,  # 0:disable, 1:enable
     interval => 10, # sec.
 };
 our $config = +{ %$default_config };
@@ -33,7 +37,7 @@ $Psmon::Process::PS_BIN = 'ps';
 # -d     : Daemon mode. Loop infinitely.
 # -D num : Debug loop mode. Loop specified times and exit.
 # -s     : Enable syslog alert.
-# -t     : Enable trace log into STDERR.
+# -t     : Enable trace log into STDOUT.
 # -q     : Skip alerts in first loop.
 OPTIONS: {
     my %opts;
@@ -61,33 +65,33 @@ my $ALERM_ACTIONS = +{
         my $msg = sprintf($PROC_ALERT_FORMAT, 'Normal', $m->name);
         my $cmt = sprintf('count=[%d]', $m->count);
         $msg .= sprintf($ALERT_COMMENT_FORMAT, $cmt);
-        logger($msg);
+        alert($msg);
     },
     $Psmon::Monitor::S_MAX => sub {
         my $m = shift;
         my $msg = sprintf($PROC_ALERT_FORMAT, 'Critical', $m->name);
         my $cmt = sprintf('count=[%d] exceeds max=[%s]', $m->count, $m->max);
         $msg .= sprintf($ALERT_COMMENT_FORMAT, $cmt);
-        logger($msg);
+        alert($msg);
     },
     $Psmon::Monitor::S_MIN => sub {
         my $m = shift;
         my $msg = sprintf($PROC_ALERT_FORMAT, 'Critical', $m->name);
         my $cmt = sprintf('count=[%d] is lower than min=[%s]', $m->count, $m->min);
         $msg .= sprintf($ALERT_COMMENT_FORMAT, $cmt);
-        logger($msg);
+        alert($msg);
     },
     $Psmon::Monitor::S_WARN => sub {
         my $m = shift;
         my $msg = sprintf($PROC_ALERT_FORMAT, 'Warning', $m->name);
         my $cmt = sprintf('count=[%d] exceeds warn=[%s]', $m->count, $m->warn);
         $msg .= sprintf($ALERT_COMMENT_FORMAT, $cmt);
-        logger($msg);
+        alert($msg);
     },
     $Psmon::Monitor::S_UNKNOWN => sub {
         my $m = shift;
         my $msg = sprintf($STD_ALERT_FORMAT, "code error. unknown status");
-        logger($msg);
+        alert($msg);
     },
 };
 
@@ -115,8 +119,10 @@ MAIN: {
             my $conf_path = "$config->{config_dir}/$conf_name";
             next if (-d $conf_path );
 
+            info("load monitor from [$conf_path]") if info();
             if(my $c = load_monitor( $conf_path )) {
                 push(@$Monitors, $c);
+                info($c->to_s()) if info();
             } else {
                 die "load monitor failed. path=[$conf_path]";
             }
@@ -126,6 +132,13 @@ MAIN: {
         # Main loop start.
         while ( not $Terminate ) {
             my $procs = Psmon::Process::Fetch();
+
+            # traceout all process if enable_trace
+            if(trace()) {
+                trace("start process list");
+                trace(Psmon::Process::ToString($_)) foreach(@$procs);
+                trace("end process list");
+            }
 
             # rotate counter and countup start.
             $_->begin_update() foreach (@$Monitors);
@@ -141,15 +154,13 @@ MAIN: {
                     if ($_->in_succession or not $SkipFirst) {
                         my $status = $_->status;
                         my $action = $ALERM_ACTIONS->{$status};
-                        $action->($_) if($action);
+                        info(sprintf("monitor=[%s] triggers action=[%s]", $_->name, $status)) if info();
+                        info($_->to_s(1)) if info();
+                        $action->($_) if ($action);
                     }
                 }
             }
             
-            if ($config->{enable_trace}) {
-                trace($_->to_s(1)) foreach (@$Monitors);
-            }
-
             # main loop control...
             if ($DebugExit > 0) {
                 # debug loop mode. Run debug-exit(-D num) times.
@@ -257,29 +268,69 @@ sub load_monitor {
     }
 }
 
+# logging routines.
+
 # * trace ( message )
-#  Print trace message when trace mode is enabled.
+#  Print log message for trace.
 sub trace {
-    my ($message) = @_;
     our $config;
-    print STDERR "TRACE: $message\n" if($config->{enable_trace});
+    return $config->{enable_trace} unless scalar(@_);
+    my ($message) = @_;
+    return unless $config->{enable_trace};
+    if($config->{enable_syslog}) {
+        my $priority = $config->{syslog_priority_trace};
+        syslog($priority, $config->{syslog_tag}, $message) if $priority;
+    }
+    printlog("TRACE: $message");
 }
 
-# * logger ( message )
-#  Print log message into syslog and trace log.
-sub logger {
-    my ($message) = @_;
+# * info ( message )
+#  Print log message for alert
+sub info {
     our $config;
-    if($config->{enable_trace}) {
-        print STDERR "TRACE: $message\n";
-    }
+    return $config->{enable_info} unless scalar(@_);
+    my ($message) = @_;
+    return unless $config->{enable_info};
     if($config->{enable_syslog}) {
-        my @com = ($config->{syslog_bin});
-        push(@com, "-p", $config->{syslog_priority});
-        push(@com, "-t", $config->{syslog_tag}) if $config->{syslog_tag};
-        push(@com, "'${message}'");
-        system(join(" ", @com));
+        my $priority = $config->{syslog_priority_info};
+        syslog($priority, $config->{syslog_tag}, $message) if $priority;
     }
+    printlog("INFO: $message");
+}
+
+# * alert ( message )
+#  Print log message for alert
+sub alert {
+    our $config;
+    return $config->{enable_alert} unless scalar(@_);
+    my ($message) = @_;
+    return unless $config->{enable_alert};
+    if($config->{enable_syslog}) {
+        my $priority = $config->{syslog_priority_alert};
+        syslog($priority, $config->{syslog_tag}, $message) if $priority;
+    }
+    printlog("ALERT: $message");
+}
+
+# logging writer routines.
+
+# * syslog ( priority, tag, message )
+#  Print log message into syslog and trace log.
+sub syslog {
+    my ($priority, $tag, $message) = @_;
+    our $config;
+    my @com = ($config->{syslog_bin});
+    push(@com, "-p", $priority);
+    push(@com, "-t", $tag) if $tag;
+    push(@com, "'${message}'");
+    system(join(" ", @com));
+}
+
+# * printlog ( message )
+#  Print log message into stdout
+sub printlog {
+    my ($message) = @_;
+    print STDOUT "$message\n";
 }
 
 
@@ -360,10 +411,10 @@ BEGIN {
     sub ToString {
         my $h = shift;
         my $buf = sprintf(
-            "* Process: pid=[%d] ppid=[%d] proc=[%s] owner=[%s:%s]\n",
+            "pid=[%d] ppid=[%d] proc=[%s] owner=[%s:%s]",
             $h->{pid}, $h->{ppid}, $h->{comm},
             $h->{user}, $h->{group});
-        $buf .= sprintf("  > %s\n", $h->{command});
+        $buf .= sprintf(" command=[%s]", $h->{command});
         return $buf;
     }
 
@@ -538,24 +589,24 @@ BEGIN {
         my $self = shift;
         my ($with_flags) = @_;
         my $buf = "";
-        $buf .= sprintf("* Monitor: %s (Psmon::Monitor, name=%s)\n",
+        $buf .= sprintf("Monitor: %s (Psmon::Monitor, name=%s)\n",
             $self->{name}, $self->{name});
-        $buf .= "- [Threshold]\n";
+        $buf .= " [Threshold]\n";
         foreach my $k (@FIELDS_TH) {
             $buf .= sprintf("  %-5s: %d\n", $k, $self->{$k}) if $self->{$k};
         }
-        $buf .= "- [Rules]\n";
+        $buf .= " [Rules]\n";
         foreach my $k (@FIELDS_RL) {
             $buf .= sprintf("  %-8s: %s\n", $k, $self->{$k}) if $self->{$k};
         }
         if ($with_flags) {
-            $buf .= "- [Flags]\n";
+            $buf .= " [Flags]\n";
             foreach my $k (@FLAGS) {
                 $buf .= sprintf("  %-8s: %s\n", $k, $self->{$k}) if defined $self->{$k} and not ref $self->{$k};
             }
             if($self->{debug}) {
-                $buf .= sprintf("- [Debug: Matched] %d processes\n", scalar(@{$self->{_debug_procs}}));
-                $buf .= Psmon::Process::ToString($_) foreach(@{$self->{_debug_procs}});
+                $buf .= sprintf(" [Debug: Matched] %d processes\n", scalar(@{$self->{_debug_procs}}));
+                $buf .= ("  * Process: " . Psmon::Process::ToString($_) . "\n") foreach(@{$self->{_debug_procs}});
             }
         }
         return $buf;
