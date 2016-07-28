@@ -119,12 +119,15 @@ MAIN: {
             my $conf_path = "$config->{config_dir}/$conf_name";
             next if (-d $conf_path );
 
-            info("load monitor from [$conf_path]") if info();
             if(my $c = load_monitor( $conf_path )) {
                 push(@$Monitors, $c);
-                info($c->to_s()) if info();
+                if(info()) {
+                    info(sprintf("Load monitor from [%s], loaded=[%s]",
+                            $conf_path, $c->name));
+                    info($c->to_s()) if $c->debug;
+                }
             } else {
-                die "load monitor failed. path=[$conf_path]";
+                die "Load monitor failed. path=[$conf_path]";
             }
         }
         closedir($dh);
@@ -155,7 +158,7 @@ MAIN: {
                         my $status = $_->status;
                         my $action = $ALERM_ACTIONS->{$status};
                         info(sprintf("monitor=[%s] triggers action=[%s]", $_->name, $status)) if info();
-                        info($_->to_s(1)) if info();
+                        info($_->to_s(1)) if $_->debug and info();
                         $action->($_) if ($action);
                     }
                 }
@@ -456,6 +459,7 @@ BEGIN {
 
     sub name  { _attr_ro('name' , @_); }
     sub memo  { _attr_ro('memo' , @_); }
+    sub debug { _attr_ro('debug'  , @_); }
     sub max   { _attr_ro('max'  , @_); }
     sub min   { _attr_ro('min'  , @_); }
     sub warn  { _attr_ro('warn' , @_); }
